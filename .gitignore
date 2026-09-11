@@ -1,0 +1,20 @@
+# Secrets
+.env
+telegram_agents/.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local runtime data
+data/
+telegram_agents/data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
