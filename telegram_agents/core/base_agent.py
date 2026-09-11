@@ -6,7 +6,7 @@ import random
 from abc import ABC, abstractmethod
 from typing import Optional
 
-import anthropic
+from openai import AsyncOpenAI
 from telegram import Bot
 from telegram.error import TelegramError
 
@@ -22,7 +22,7 @@ class BaseAgent(ABC):
     handle: str = "agent"          # matches DB sender field and ChromaDB collection name
     token_env: str = ""            # env var holding this bot's Telegram token
     response_probability: float = 0.75
-    model: str = "claude-sonnet-4-6"
+    model: str = "gpt-5-nano"
 
     @property
     @abstractmethod
@@ -40,7 +40,7 @@ class BaseAgent(ABC):
         self.delay_max = float(os.getenv("RESPONSE_DELAY_MAX", "8"))
         self.db_path = os.getenv("DB_PATH", "./data/conversations.db")
         self.chroma_path = os.getenv("CHROMA_PATH", "./data/chroma")
-        self._client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self._running = False
 
     async def run(self) -> None:
@@ -71,11 +71,11 @@ class BaseAgent(ABC):
             transcript = "\n".join(
                 f"{msg['sender_name']}: {msg['content']}" for msg in messages
             )
-            response = await self._client.messages.create(
+            response = await self._client.chat.completions.create(
                 model=self.model,
                 max_tokens=400,
-                system=self.persona_prompt,
                 messages=[
+                    {"role": "system", "content": self.persona_prompt},
                     {
                         "role": "user",
                         "content": (
@@ -85,10 +85,10 @@ class BaseAgent(ABC):
                             "shifted, and where each philosopher currently stands. Be concise. "
                             f"No markdown. Write as {self.name}."
                         ),
-                    }
+                    },
                 ],
             )
-            summary = response.content[0].text.strip()
+            summary = response.choices[0].message.content.strip()
             await self.bot.send_message(chat_id=self.chat_id, text=summary)
             await log_message(
                 chat_id=self.chat_id,
@@ -130,7 +130,7 @@ class BaseAgent(ABC):
         except Exception:
             passages = []
 
-        reply = await self._call_claude(context, passages, conviction)
+        reply = await self._call_llm(context, passages, conviction)
         if not reply:
             return
 
@@ -145,15 +145,18 @@ class BaseAgent(ABC):
         )
         await self._update_conviction_from_reply(reply)
 
-    async def _call_claude(self, context, passages, conviction) -> Optional[str]:
+    async def _call_llm(self, context, passages, conviction) -> Optional[str]:
         try:
-            response = await self._client.messages.create(
+            messages = self._build_messages(context)
+            response = await self._client.chat.completions.create(
                 model=self.model,
                 max_tokens=300,
-                system=self._build_system_prompt(passages, conviction),
-                messages=self._build_messages(context),
+                messages=[
+                    {"role": "system", "content": self._build_system_prompt(passages, conviction)},
+                    *messages,
+                ],
             )
-            return response.content[0].text.strip()
+            return response.choices[0].message.content.strip()
         except Exception:
             return None
 
@@ -209,27 +212,25 @@ class BaseAgent(ABC):
 
     async def _update_conviction_from_reply(self, reply: str) -> None:
         try:
-            response = await self._client.messages.create(
+            prompt = (
+                "Does the following statement express doubt, uncertainty, or "
+                "weakening of a philosophical position, or does it express "
+                "confidence and reinforcement?\n"
+                "Reply with exactly one word: DOUBT or REINFORCE.\n\n"
+                f"Statement: {reply}"
+            )
+            response = await self._client.chat.completions.create(
                 model=self.model,
                 max_tokens=5,
-                system="You are a sentiment classifier. Respond with only one word.",
                 messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            "Does the following statement express doubt, uncertainty, or "
-                            "weakening of a philosophical position, or does it express "
-                            "confidence and reinforcement?\n"
-                            "Reply with exactly one word: DOUBT or REINFORCE.\n\n"
-                            f"Statement: {reply}"
-                        ),
-                    }
+                    {"role": "system", "content": "You are a sentiment classifier. Respond with only one word."},
+                    {"role": "user", "content": prompt},
                 ],
             )
-            label = response.content[0].text.strip().upper()
-            if label == "DOUBT":
+            result = response.choices[0].message.content.strip().upper()
+            if result == "DOUBT":
                 await update_conviction(self.handle, -0.05, self.db_path)
-            elif label == "REINFORCE":
+            elif result == "REINFORCE":
                 await update_conviction(self.handle, 0.05, self.db_path)
         except Exception:
             pass
