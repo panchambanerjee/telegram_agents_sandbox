@@ -49,23 +49,19 @@ Only **NietzscheBot** listens for updates. All three bots must be **members of t
 
 Private chats with a single bot are ignored unless that chat id is `GROUP_CHAT_ID`. The intended surface is the **group**.
 
-## Source texts (RAG)
+## Grounding texts
 
-Place files under `telegram_agents/texts/`. Folder names can be the handle or the tradition:
+The bots are not fine-tuned. At runtime they retrieve passages from a local RAG index of each thinker’s major works:
 
-```
-telegram_agents/texts/
-├── nihilist/            # or nihilism/
-│   └── genealogy_of_morality.pdf
-├── existentialism/      # or existentialist/
-│   └── being_and_nothingess.pdf
-└── absurdism/           # or absurdist/
-    └── myth_of_sisyphus.pdf
-```
+- **Nietzsche** — *On the Genealogy of Morality* (and the broader genealogical critique of values)
+- **Sartre** — *Being and Nothingness* (existence, nothingness, bad faith)
+- **Camus** — *The Myth of Sisyphus* (the absurd, revolt, living without appeal)
 
-Supported: `.pdf`, `.txt`, `.md`. First run extracts, chunks (~400 words, 50-word overlap), and upserts into Chroma at `CHROMA_PATH`. Later starts skip files that are already loaded. PDFs are not committed (copyright).
+Put your own copies under `telegram_agents/texts/` in a folder named for the tradition (`nihilist` / `nihilism`, `existentialist` / `existentialism`, `absurdist` / `absurdism`). `.pdf`, `.txt`, and `.md` are accepted. First run chunks them into Chroma (`CHROMA_PATH`); later starts skip already-loaded sources. Publisher files stay local and are gitignored.
 
-Conviction steers retrieval: low score appends doubt language to the query; high score appends certainty language.
+Conviction steers retrieval: a low score pulls toward doubt; a high score toward the core argument.
+
+Bots also **react** to some group messages (not every turn). The emoji is chosen from the last message’s topic and that philosopher’s palette.
 
 ## Install and run
 
@@ -91,7 +87,7 @@ You should see RAG load (or “already loaded”), three agents ready, then:
 
 Ctrl+C shuts down cleanly.
 
-First ingest of a long PDF (e.g. *Being and Nothingness*) can take a few minutes. The first OpenAI calls can also take a while; the bots should show **typing** in Telegram during that wait.
+First ingest of a long work (Sartre especially) can take a few minutes. The first OpenAI calls can also take a while; the bots should show **typing** in Telegram during that wait.
 
 ## Group commands
 
@@ -143,7 +139,7 @@ See `telegram_agents/.env.example`.
 | `CHROMA_PATH` | Chroma persistence dir |
 | `TEXTS_PATH` | Source texts directory |
 
-Each agent has a `response_probability` (Nietzsche 0.80, Sartre 0.75, Camus 0.70) so they do not all answer every turn.
+Each agent has a `response_probability` (Nietzsche 0.80, Sartre 0.75, Camus 0.70) so they do not all answer every turn. Reactions are independent and less frequent.
 
 ## Layout
 
@@ -163,7 +159,7 @@ telegram_agents_sandbox/
     ├── rag/
     │   ├── embedder.py
     │   └── retriever.py
-    ├── texts/          # local PDFs; not in git
+    ├── texts/          # local source works; not in git
     └── data/           # SQLite + Chroma; not in git
 ```
 
@@ -175,8 +171,8 @@ telegram_agents_sandbox/
 **Messages log but nobody posts, or `[Name] LLM error: Unsupported parameter: max_tokens`**  
 Reasoning models need `max_completion_tokens`, not `max_tokens`. That is already in `base_agent.py`. Restart after pulling.
 
-**Empty replies / silent skip after “Calling LLM”**  
-`gpt-5-nano` can spend the budget on hidden reasoning. The code uses `reasoning_effort=low` and a higher completion limit. Send a **new** message; already-processed rows will not be retried (`agent_cursor`).
+**Empty replies / `finish_reason=length`**  
+`gpt-5-nano` can spend the budget on hidden reasoning. The code retries with a larger `max_completion_tokens` cap. Send a **new** message; already-processed rows will not be retried (`agent_cursor`).
 
 **`RuntimeError: threads can only be started once`**  
 Old aiosqlite pattern `async with await connect()`. Current `core/database.py` uses a single context manager.
@@ -192,4 +188,4 @@ Normal: random skip plus cursor advance. `/reset` if you want a clean thread.
 
 ## License and texts
 
-Application code in this repo is yours to use as a sandbox. Do **not** commit scanned or publisher PDFs of Nietzsche, Sartre, or Camus; keep them under `texts/` locally.
+Application code in this repo is yours to use as a sandbox. Do **not** commit publisher editions of the grounding works; keep them under `texts/` locally.

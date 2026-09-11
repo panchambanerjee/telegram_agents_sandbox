@@ -8,6 +8,8 @@ class NihilistAgent(BaseAgent):
     handle = "nihilist"
     token_env = "NIHILIST_BOT_TOKEN"
     response_probability = 0.80
+    reaction_probability = 0.45
+    reaction_palette = ("⚡", "🔥", "🤯", "🤨", "👎")
 
     @property
     def persona_prompt(self) -> str:
@@ -29,6 +31,8 @@ class ExistentialistAgent(BaseAgent):
     handle = "existentialist"
     token_env = "EXISTENTIALIST_BOT_TOKEN"
     response_probability = 0.75
+    reaction_probability = 0.35
+    reaction_palette = ("🤔", "👀", "🤝", "🤨", "✍️")
 
     @property
     def persona_prompt(self) -> str:
@@ -50,6 +54,8 @@ class AbsurdistAgent(BaseAgent):
     handle = "absurdist"
     token_env = "ABSURDIST_BOT_TOKEN"
     response_probability = 0.70
+    reaction_probability = 0.40
+    reaction_palette = ("🗿", "🤷", "😎", "🌚", "👍")
 
     @property
     def persona_prompt(self) -> str:

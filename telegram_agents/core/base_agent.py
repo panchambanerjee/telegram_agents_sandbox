@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from openai import AsyncOpenAI
-from telegram import Bot
+from telegram import Bot, ReactionTypeEmoji
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 
@@ -17,6 +17,27 @@ from core.database import (
 )
 from rag.retriever import retrieve, format_retrieved_passages
 
+# Telegram's default reaction set (subset). Keep picks inside this list.
+_SAFE_REACTIONS = {
+    "👍", "👎", "❤️", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "😢",
+    "🎉", "🤩", "🙏", "👌", "🤡", "🥱", "😍", "🌚", "💯", "🤣", "⚡",
+    "🏆", "💔", "🤨", "😐", "😈", "😴", "😭", "🤓", "👀", "🙈", "😇",
+    "🤝", "🤗", "🤪", "🗿", "😎", "🤷", "😡",
+}
+
+_TOPIC_REACTIONS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("god", "religion", "church", "faith", "divine", "soul"), ("⚡", "🤨", "🔥")),
+    (("meaning", "purpose", "point", "why live", "nihil"), ("🤔", "🤯", "🤷")),
+    (("death", "die", "suicide", "void", "nothingness"), ("🗿", "🌚", "😢")),
+    (("freedom", "choice", "commit", "action", "bad faith"), ("✍️", "🤔", "👀")),
+    (("absurd", "sisyphus", "revolt", "plague", "stranger"), ("🗿", "🤷", "😎")),
+    (("power", "strong", "slave", "moral", "overman", "ubermensch"), ("⚡", "🔥", "👎")),
+    (("love", "life", "happy", "joy", "hope"), ("❤️", "🥰", "😎")),
+    (("joke", "lol", "haha", "funny", "lmao"), ("🤣", "🤡", "😁")),
+    (("agree", "true", "exactly", "yes"), ("👍", "💯", "🤝")),
+    (("wrong", "naive", "illusion", "cope"), ("🤨", "👎", "🤯")),
+)
+
 
 class BaseAgent(ABC):
     name: str = "Agent"
@@ -24,6 +45,8 @@ class BaseAgent(ABC):
     token_env: str = ""            # env var holding this bot's Telegram token
     response_probability: float = 0.75
     model: str = "gpt-5-nano"
+    reaction_probability: float = 0.4
+    reaction_palette: tuple[str, ...] = ("👍", "🤔", "🔥")
 
     @property
     @abstractmethod
@@ -126,6 +149,42 @@ class BaseAgent(ABC):
             await asyncio.sleep(step)
             elapsed += step
 
+    async def _react_to_message(
+        self, telegram_msg_id: int | None, content: str = ""
+    ) -> None:
+        if not telegram_msg_id:
+            return
+        emoji = self._choose_reaction(content)
+        if not emoji:
+            return
+        try:
+            await self.bot.set_message_reaction(
+                chat_id=self.chat_id,
+                message_id=int(telegram_msg_id),
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+            print(f"[{self.name}] Reacted {emoji} to msg {telegram_msg_id}")
+        except TelegramError as exc:
+            print(f"[{self.name}] Reaction failed: {exc}")
+
+    def _choose_reaction(self, text: str) -> Optional[str]:
+        if random.random() > self.reaction_probability:
+            return None
+        blob = (text or "").lower()
+        topic_hits: list[str] = []
+        for keys, emojis in _TOPIC_REACTIONS:
+            if any(key in blob for key in keys):
+                topic_hits.extend(emojis)
+        palette = [e for e in self.reaction_palette if e in _SAFE_REACTIONS]
+        if not palette:
+            palette = ["👍"]
+        if topic_hits:
+            overlap = [e for e in topic_hits if e in palette]
+            pool = overlap or [e for e in topic_hits if e in _SAFE_REACTIONS] or palette
+        else:
+            pool = palette
+        return random.choice(pool)
+
     async def _poll_and_respond(self) -> None:
         messages = await get_unprocessed_messages(
             self.handle, self.chat_id, self.db_path
@@ -138,6 +197,12 @@ class BaseAgent(ABC):
         if random.random() > self.response_probability:
             print(f"[{self.name}] Skipping this round.")
             return
+
+        trigger = messages[-1]
+        await self._react_to_message(
+            trigger.get("telegram_msg_id"),
+            trigger.get("content") or "",
+        )
 
         typing_task = asyncio.create_task(self._keep_typing())
         try:
@@ -194,26 +259,46 @@ class BaseAgent(ABC):
         await self._update_conviction_from_reply(reply)
 
     async def _call_llm(self, context, passages, conviction) -> Optional[str]:
+        # gpt-5-nano spends completion tokens on hidden reasoning first.
+        # A small cap yields finish_reason=length and empty visible text.
+        budgets = (1200, 2500)
+        messages = self._build_messages(context)
+        system = self._build_system_prompt(passages, conviction)
         try:
-            messages = self._build_messages(context)
-            response = await self._client.chat.completions.create(
-                model=self.model,
-                max_completion_tokens=220,
-                reasoning_effort="low",
-                messages=[
-                    {"role": "system", "content": self._build_system_prompt(passages, conviction)},
-                    *messages,
-                ],
-            )
-            choice = response.choices[0]
-            text = (choice.message.content or "").strip()
-            if not text:
+            for attempt, budget in enumerate(budgets, start=1):
+                payload = messages
+                if attempt > 1:
+                    payload = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your last attempt used all tokens on reasoning and posted nothing. "
+                                "Reply now in 1-2 short sentences only."
+                            ),
+                        },
+                    ]
+                    print(f"[{self.name}] Retrying LLM with max_completion_tokens={budget}")
+                response = await self._client.chat.completions.create(
+                    model=self.model,
+                    max_completion_tokens=budget,
+                    reasoning_effort="low",
+                    messages=[
+                        {"role": "system", "content": system},
+                        *payload,
+                    ],
+                )
+                choice = response.choices[0]
+                text = (choice.message.content or "").strip()
+                if text:
+                    return self._clip_reply(text)
                 print(
                     f"[{self.name}] LLM returned no text "
-                    f"(finish_reason={choice.finish_reason})"
+                    f"(finish_reason={choice.finish_reason}, attempt={attempt})"
                 )
-                return None
-            return self._clip_reply(text)
+                if choice.finish_reason != "length":
+                    return None
+            return None
         except Exception as exc:
             print(f"[{self.name}] LLM error: {exc}")
             return None
