@@ -1,5 +1,10 @@
 # Entry point: initialises DB, RAG, dispatcher, and agent loops
 
+import warnings
+
+warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+warnings.filterwarnings("ignore", message="fontTools is required")
+
 import asyncio
 import os
 import signal
@@ -16,7 +21,10 @@ async def main() -> None:
     await init_db(db_path)
 
     try:
-        counts = load_all_texts()
+        counts = load_all_texts(
+            texts_path=os.getenv("TEXTS_PATH", "./texts"),
+            chroma_path=os.getenv("CHROMA_PATH", "./data/chroma"),
+        )
         for agent, n in counts.items():
             print(f"[RAG] {agent}: {n} chunks loaded")
     except Exception as e:

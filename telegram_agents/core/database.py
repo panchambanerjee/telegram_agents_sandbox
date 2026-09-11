@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
 import aiosqlite
 
@@ -12,10 +13,13 @@ DB_PATH = "./data/conversations.db"
 _AGENTS = ("nihilist", "existentialist", "absurdist")
 
 
-async def _connect(db_path: str) -> aiosqlite.Connection:
-    db = await aiosqlite.connect(db_path)
-    db.row_factory = aiosqlite.Row
-    return db
+@asynccontextmanager
+async def _connect(db_path: str) -> AsyncIterator[aiosqlite.Connection]:
+    # aiosqlite.connect() already starts the worker thread; do not
+    # `async with await connect()` or the thread is started twice.
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        yield db
 
 
 def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
@@ -24,7 +28,7 @@ def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
 
 async def init_db(db_path: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(db_path)) or ".", exist_ok=True)
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS message_log (
@@ -72,7 +76,7 @@ async def log_message(
     telegram_msg_id: int | None = None,
     db_path: str = DB_PATH,
 ) -> int:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             """
             INSERT INTO message_log (chat_id, sender, sender_name, content, telegram_msg_id)
@@ -89,7 +93,7 @@ async def get_recent_messages(
     limit: int = 20,
     db_path: str = DB_PATH,
 ) -> list[dict]:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             """
             SELECT * FROM (
@@ -111,7 +115,7 @@ async def get_unprocessed_messages(
     chat_id: int,
     db_path: str = DB_PATH,
 ) -> list[dict]:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             "SELECT last_seen_id FROM agent_cursor WHERE agent = ?",
             (agent,),
@@ -133,7 +137,7 @@ async def get_unprocessed_messages(
 
 
 async def advance_cursor(agent: str, last_id: int, db_path: str = DB_PATH) -> None:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute(
             """
             INSERT INTO agent_cursor (agent, last_seen_id)
@@ -149,7 +153,7 @@ async def message_already_logged(
     telegram_msg_id: int,
     db_path: str = DB_PATH,
 ) -> bool:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             """
             SELECT 1 FROM message_log
@@ -162,14 +166,14 @@ async def message_already_logged(
 
 
 async def clear_chat(chat_id: int, db_path: str = DB_PATH) -> None:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute("DELETE FROM message_log WHERE chat_id = ?", (chat_id,))
         await db.execute("UPDATE agent_cursor SET last_seen_id = 0")
         await db.commit()
 
 
 async def get_conviction(agent: str, db_path: str = DB_PATH) -> float:
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute(
             "SELECT score FROM conviction_scores WHERE agent = ?",
             (agent,),
@@ -181,7 +185,7 @@ async def get_conviction(agent: str, db_path: str = DB_PATH) -> float:
 async def update_conviction(agent: str, delta: float, db_path: str = DB_PATH) -> float:
     current = await get_conviction(agent, db_path=db_path)
     new_score = max(0.0, min(1.0, current + delta))
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         await db.execute(
             """
             INSERT INTO conviction_scores (agent, score, updated_at)
@@ -198,7 +202,7 @@ async def update_conviction(agent: str, delta: float, db_path: str = DB_PATH) ->
 
 async def get_all_convictions(db_path: str = DB_PATH) -> dict[str, float]:
     scores = {agent: 0.5 for agent in _AGENTS}
-    async with await _connect(db_path) as db:
+    async with _connect(db_path) as db:
         cursor = await db.execute("SELECT agent, score FROM conviction_scores")
         rows = await cursor.fetchall()
         for row in rows:

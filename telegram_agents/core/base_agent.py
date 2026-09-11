@@ -8,6 +8,7 @@ from typing import Optional
 
 from openai import AsyncOpenAI
 from telegram import Bot
+from telegram.constants import ChatAction
 from telegram.error import TelegramError
 
 from core.database import (
@@ -73,7 +74,8 @@ class BaseAgent(ABC):
             )
             response = await self._client.chat.completions.create(
                 model=self.model,
-                max_tokens=400,
+                max_completion_tokens=800,
+                reasoning_effort="low",
                 messages=[
                     {"role": "system", "content": self.persona_prompt},
                     {
@@ -88,7 +90,10 @@ class BaseAgent(ABC):
                     },
                 ],
             )
-            summary = response.choices[0].message.content.strip()
+            summary = (response.choices[0].message.content or "").strip()
+            if not summary:
+                print(f"[{self.name}] Empty summary from LLM.")
+                return
             await self.bot.send_message(chat_id=self.chat_id, text=summary)
             await log_message(
                 chat_id=self.chat_id,
@@ -99,6 +104,27 @@ class BaseAgent(ABC):
             )
         except Exception as exc:
             print(f"[{self.name}] Error in post_summary: {exc}")
+
+    async def _send_typing(self) -> None:
+        try:
+            await self.bot.send_chat_action(
+                chat_id=self.chat_id, action=ChatAction.TYPING
+            )
+        except TelegramError:
+            pass
+
+    async def _keep_typing(self) -> None:
+        while True:
+            await self._send_typing()
+            await asyncio.sleep(4)
+
+    async def _pause_with_typing(self, seconds: float) -> None:
+        elapsed = 0.0
+        while elapsed < seconds:
+            await self._send_typing()
+            step = min(4.0, seconds - elapsed)
+            await asyncio.sleep(step)
+            elapsed += step
 
     async def _poll_and_respond(self) -> None:
         messages = await get_unprocessed_messages(
@@ -113,28 +139,50 @@ class BaseAgent(ABC):
             print(f"[{self.name}] Skipping this round.")
             return
 
-        await asyncio.sleep(random.uniform(self.delay_min, self.delay_max))
-
-        conviction = await get_conviction(self.handle, self.db_path)
-        context = await get_recent_messages(
-            self.chat_id, self.context_window, self.db_path
-        )
-        query = context[-1]["content"] if context else ""
+        typing_task = asyncio.create_task(self._keep_typing())
         try:
-            passages = retrieve(
-                self.handle,
-                query,
-                conviction_score=conviction,
-                chroma_path=self.chroma_path,
+            conviction = await get_conviction(self.handle, self.db_path)
+            context = await get_recent_messages(
+                self.chat_id, self.context_window, self.db_path
             )
-        except Exception:
-            passages = []
+            query = context[-1]["content"] if context else ""
+            try:
+                passages = await asyncio.to_thread(
+                    retrieve,
+                    self.handle,
+                    query,
+                    5,
+                    conviction,
+                    self.chroma_path,
+                )
+            except Exception as exc:
+                print(f"[{self.name}] RAG error: {exc}")
+                passages = []
 
-        reply = await self._call_llm(context, passages, conviction)
-        if not reply:
-            return
+            print(f"[{self.name}] Calling LLM ({len(context)} context msgs, {len(passages)} passages)...")
+            reply = await self._call_llm(context, passages, conviction)
+            if not reply:
+                print(f"[{self.name}] Empty LLM reply, skipping post.")
+                return
 
-        sent = await self.bot.send_message(chat_id=self.chat_id, text=reply)
+            pause = random.uniform(self.delay_min, self.delay_max)
+            print(f"[{self.name}] Typing pause {pause:.1f}s...")
+            await self._pause_with_typing(pause)
+
+            sent = await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=reply,
+                read_timeout=30,
+                write_timeout=30,
+                connect_timeout=30,
+            )
+            print(f"[{self.name}] Posted to Telegram.")
+        finally:
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
         await log_message(
             self.chat_id,
             self.handle,
@@ -150,15 +198,35 @@ class BaseAgent(ABC):
             messages = self._build_messages(context)
             response = await self._client.chat.completions.create(
                 model=self.model,
-                max_tokens=300,
+                max_completion_tokens=220,
+                reasoning_effort="low",
                 messages=[
                     {"role": "system", "content": self._build_system_prompt(passages, conviction)},
                     *messages,
                 ],
             )
-            return response.choices[0].message.content.strip()
-        except Exception:
+            choice = response.choices[0]
+            text = (choice.message.content or "").strip()
+            if not text:
+                print(
+                    f"[{self.name}] LLM returned no text "
+                    f"(finish_reason={choice.finish_reason})"
+                )
+                return None
+            return self._clip_reply(text)
+        except Exception as exc:
+            print(f"[{self.name}] LLM error: {exc}")
             return None
+
+    @staticmethod
+    def _clip_reply(text: str, max_chars: int = 320) -> str:
+        text = " ".join(text.split())
+        if len(text) <= max_chars:
+            return text
+        trimmed = text[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        if not trimmed.endswith((".", "!", "?")):
+            trimmed += "."
+        return trimmed
 
     def _build_system_prompt(self, passages: list[dict], conviction: float) -> str:
         if conviction < 0.35:
@@ -179,16 +247,16 @@ class BaseAgent(ABC):
 
         sections = [self.persona_prompt, conviction_state]
         if passages:
-            formatted = format_retrieved_passages(passages)
+            formatted = format_retrieved_passages(passages, max_chars=700)
             sections.append(
-                "The following passages from your philosophical tradition are relevant "
-                "to this conversation. Draw on them to ground your arguments:\n\n"
+                "The following short passages from your tradition may help. "
+                "Do not quote them at length. Use at most one brief idea:\n\n"
                 f"{formatted}"
             )
         sections.append(
             "You are in a Telegram group chat with two other AI agents who hold competing philosophical positions.\n"
-            "Keep replies to 2-4 sentences. Write like you are texting — no markdown, no bullet points.\n"
-            "Engage directly with what was just said. Do not start your message with your own name."
+            "Reply like a text message: 1-2 short sentences, under 45 words. No markdown, no lists, no quotes.\n"
+            "Make one sharp point and stop. Engage the last message. Do not start with your own name."
         )
         return "\n\n".join(sections)
 
@@ -206,7 +274,7 @@ class BaseAgent(ABC):
         return [
             {
                 "role": "user",
-                "content": f"Here is the conversation so far:\n\n{transcript}\n\nReply as {self.name}.",
+                "content": f"Here is the conversation so far:\n\n{transcript}\n\nReply as {self.name} in 1-2 short sentences.",
             }
         ]
 
@@ -221,13 +289,14 @@ class BaseAgent(ABC):
             )
             response = await self._client.chat.completions.create(
                 model=self.model,
-                max_tokens=5,
+                max_completion_tokens=50,
+                reasoning_effort="low",
                 messages=[
                     {"role": "system", "content": "You are a sentiment classifier. Respond with only one word."},
                     {"role": "user", "content": prompt},
                 ],
             )
-            result = response.choices[0].message.content.strip().upper()
+            result = (response.choices[0].message.content or "").strip().upper()
             if result == "DOUBT":
                 await update_conviction(self.handle, -0.05, self.db_path)
             elif result == "REINFORCE":

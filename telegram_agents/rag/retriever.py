@@ -7,7 +7,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 
 CHROMA_PATH = "./data/chroma"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-DEFAULT_TOP_K = 3
+DEFAULT_TOP_K = 5
 
 
 def _embedding_function(model_name: str = EMBEDDING_MODEL):
@@ -63,6 +63,8 @@ def retrieve(
                 "text": text,
                 "source": metadata.get("source"),
                 "chunk_index": metadata.get("chunk_index"),
+                "page_start": metadata.get("page_start"),
+                "page_end": metadata.get("page_end"),
                 "distance": distance,
             }
         )
@@ -71,10 +73,17 @@ def retrieve(
     return passages
 
 
-def format_retrieved_passages(passages: list[dict], max_chars: int = 1200) -> str:
+def format_retrieved_passages(passages: list[dict], max_chars: int = 2000) -> str:
     blocks = []
     for passage in passages:
-        source = passage.get("source", "")
+        source = passage.get("source", "") or ""
+        page_start = passage.get("page_start")
+        page_end = passage.get("page_end")
+        if page_start:
+            if page_end and page_end != page_start:
+                source = f"{source}, p. {page_start}-{page_end}"
+            else:
+                source = f"{source}, p. {page_start}"
         text = passage.get("text", "")
         blocks.append(f"[Source: {source}]\n{text}")
     formatted = "\n\n".join(blocks)

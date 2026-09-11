@@ -14,6 +14,9 @@ env/
 data/
 telegram_agents/data/
 
+# Local source PDFs (copyrighted editions; keep on disk, not in git)
+*.pdf
+
 # OS / editor
 .DS_Store
 .idea/
